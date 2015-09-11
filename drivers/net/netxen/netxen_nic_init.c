@@ -276,7 +276,7 @@ int netxen_alloc_sw_resources(struct netxen_adapter *adapter)
 
 		}
 		rds_ring->rx_buf_arr = (struct netxen_rx_buffer *)
-			vmalloc(RCV_BUFF_RINGSIZE(rds_ring));
+			vzalloc(RCV_BUFF_RINGSIZE(rds_ring));
 		if (rds_ring->rx_buf_arr == NULL) {
 			printk(KERN_ERR "%s: Failed to allocate "
 				"rx buffer ring %d\n",
@@ -284,7 +284,6 @@ int netxen_alloc_sw_resources(struct netxen_adapter *adapter)
 			/* free whatever was already allocated */
 			goto err_out;
 		}
-		memset(rds_ring->rx_buf_arr, 0, RCV_BUFF_RINGSIZE(rds_ring));
 		INIT_LIST_HEAD(&rds_ring->free_list);
 		/*
 		 * Now go through all of them, set reference handles
@@ -673,7 +672,10 @@ netxen_need_fw_reset(struct netxen_adapter *adapter)
 }
 
 static char *fw_name[] = {
-	"nxromimg.bin", "nx3fwct.bin", "nx3fwmn.bin", "flash",
+	NX_P2_MN_ROMIMAGE_NAME,
+	NX_P3_CT_ROMIMAGE_NAME,
+	NX_P3_MN_ROMIMAGE_NAME,
+	NX_FLASH_ROMIMAGE_NAME,
 };
 
 int
@@ -1199,7 +1201,6 @@ netxen_process_rcv(struct netxen_adapter *adapter,
 	if (pkt_offset)
 		skb_pull(skb, pkt_offset);
 
-	skb->truesize = skb->len + sizeof(struct sk_buff);
 	skb->protocol = eth_type_trans(skb, netdev);
 
 	napi_gro_receive(&sds_ring->napi, skb);
@@ -1260,8 +1261,6 @@ netxen_process_lro(struct netxen_adapter *adapter,
 		data_offset = l4_hdr_offset + TCP_HDR_SIZE;
 
 	skb_put(skb, lro_length + data_offset);
-
-	skb->truesize = skb->len + sizeof(struct sk_buff) + skb_headroom(skb);
 
 	skb_pull(skb, l2_hdr_offset);
 	skb->protocol = eth_type_trans(skb, netdev);

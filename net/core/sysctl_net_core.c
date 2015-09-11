@@ -10,7 +10,9 @@
 #include <linux/module.h>
 #include <linux/socket.h>
 #include <linux/netdevice.h>
+#include <linux/ratelimit.h>
 #include <linux/init.h>
+
 #include <net/ip.h>
 #include <net/sock.h>
 
@@ -98,6 +100,15 @@ static struct ctl_table net_core_table[] = {
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec
 	},
+#ifdef CONFIG_BPF_JIT
+	{
+		.procname	= "bpf_jit_enable",
+		.data		= &bpf_jit_enable,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec
+	},
+#endif
 	{
 		.ctl_name	= NET_CORE_WARNINGS,
 		.procname	= "warnings",

@@ -35,6 +35,7 @@
 #include <linux/resource.h>
 #include <linux/notifier.h>
 #include <linux/suspend.h>
+#include <linux/rwsem.h>
 #include <asm/uaccess.h>
 
 #include <trace/events/module.h>
@@ -42,6 +43,8 @@
 extern int max_threads;
 
 static struct workqueue_struct *khelper_wq;
+
+static DECLARE_RWSEM(umhelper_sem);
 
 #ifdef CONFIG_MODULES
 
@@ -106,36 +109,27 @@ int __request_module(bool wait, const char *fmt, ...)
 	atomic_inc(&kmod_concurrent);
 	if (atomic_read(&kmod_concurrent) > max_modprobes) {
 		/* We may be blaming an innocent here, but unlikely */
-		if (kmod_loop_msg++ < 5)
+		if (kmod_loop_msg < 5) {
 			printk(KERN_ERR
 			       "request_module: runaway loop modprobe %s\n",
 			       module_name);
+			kmod_loop_msg++;
+		}
 		atomic_dec(&kmod_concurrent);
 		return -ENOMEM;
 	}
 
 	trace_module_request(module_name, wait, _RET_IP_);
 
-	ret = call_usermodehelper(modprobe_path, argv, envp,
-			wait ? UMH_WAIT_PROC : UMH_WAIT_EXEC);
+	ret = call_usermodehelper_fns(modprobe_path, argv, envp,
+			wait ? UMH_WAIT_PROC : UMH_WAIT_EXEC,
+			NULL, NULL, NULL);
+
 	atomic_dec(&kmod_concurrent);
 	return ret;
 }
 EXPORT_SYMBOL(__request_module);
 #endif /* CONFIG_MODULES */
-
-struct subprocess_info {
-	struct work_struct work;
-	struct completion *complete;
-	struct cred *cred;
-	char *path;
-	char **argv;
-	char **envp;
-	enum umh_wait wait;
-	int retval;
-	struct file *stdin;
-	void (*cleanup)(char **argv, char **envp);
-};
 
 /*
  * This is the task which runs the usermode application
@@ -184,9 +178,16 @@ static int ____call_usermodehelper(void *data)
 	 */
 	set_user_nice(current, 0);
 
+	if (sub_info->init) {
+		retval = sub_info->init(sub_info);
+		if (retval)
+			goto fail;
+	}
+
 	retval = kernel_execve(sub_info->path, sub_info->argv, sub_info->envp);
 
 	/* Exec failed? */
+fail:
 	sub_info->retval = retval;
 	do_exit(0);
 }
@@ -194,7 +195,7 @@ static int ____call_usermodehelper(void *data)
 void call_usermodehelper_freeinfo(struct subprocess_info *info)
 {
 	if (info->cleanup)
-		(*info->cleanup)(info->argv, info->envp);
+		(*info->cleanup)(info);
 	if (info->cred)
 		put_cred(info->cred);
 	kfree(info);
@@ -284,6 +285,7 @@ static void __call_usermodehelper(struct work_struct *work)
  * If set, call_usermodehelper_exec() will exit immediately returning -EBUSY
  * (used for preventing user land processes from being created after the user
  * land has been frozen during a system-wide hibernation or suspend operation).
+ * Should always be manipulated under umhelper_sem acquired for write.
  */
 static int usermodehelper_disabled;
 
@@ -302,6 +304,18 @@ static DECLARE_WAIT_QUEUE_HEAD(running_helpers_waitq);
  */
 #define RUNNING_HELPERS_TIMEOUT	(5 * HZ)
 
+void read_lock_usermodehelper(void)
+{
+	down_read(&umhelper_sem);
+}
+EXPORT_SYMBOL_GPL(read_lock_usermodehelper);
+
+void read_unlock_usermodehelper(void)
+{
+	up_read(&umhelper_sem);
+}
+EXPORT_SYMBOL_GPL(read_unlock_usermodehelper);
+
 /**
  * usermodehelper_disable - prevent new helpers from being started
  */
@@ -309,8 +323,10 @@ int usermodehelper_disable(void)
 {
 	long retval;
 
+	down_write(&umhelper_sem);
 	usermodehelper_disabled = 1;
-	smp_mb();
+	up_write(&umhelper_sem);
+
 	/*
 	 * From now on call_usermodehelper_exec() won't start any new
 	 * helpers, so it is sufficient if running_helpers turns out to
@@ -323,7 +339,9 @@ int usermodehelper_disable(void)
 	if (retval)
 		return 0;
 
+	down_write(&umhelper_sem);
 	usermodehelper_disabled = 0;
+	up_write(&umhelper_sem);
 	return -EAGAIN;
 }
 
@@ -332,8 +350,19 @@ int usermodehelper_disable(void)
  */
 void usermodehelper_enable(void)
 {
+	down_write(&umhelper_sem);
 	usermodehelper_disabled = 0;
+	up_write(&umhelper_sem);
 }
+
+/**
+ * usermodehelper_is_disabled - check if new helpers are allowed to be started
+ */
+bool usermodehelper_is_disabled(void)
+{
+	return usermodehelper_disabled;
+}
+EXPORT_SYMBOL_GPL(usermodehelper_is_disabled);
 
 static void helper_lock(void)
 {
@@ -406,21 +435,31 @@ void call_usermodehelper_setkeys(struct subprocess_info *info,
 EXPORT_SYMBOL(call_usermodehelper_setkeys);
 
 /**
- * call_usermodehelper_setcleanup - set a cleanup function
+ * call_usermodehelper_setfns - set a cleanup/init function
  * @info: a subprocess_info returned by call_usermodehelper_setup
  * @cleanup: a cleanup function
+ * @init: an init function
+ * @data: arbitrary context sensitive data
  *
- * The cleanup function is just befor ethe subprocess_info is about to
+ * The init function is used to customize the helper process prior to
+ * exec.  A non-zero return code causes the process to error out, exit,
+ * and return the failure to the calling process
+ *
+ * The cleanup function is just before ethe subprocess_info is about to
  * be freed.  This can be used for freeing the argv and envp.  The
  * Function must be runnable in either a process context or the
  * context in which call_usermodehelper_exec is called.
  */
-void call_usermodehelper_setcleanup(struct subprocess_info *info,
-				    void (*cleanup)(char **argv, char **envp))
+void call_usermodehelper_setfns(struct subprocess_info *info,
+		    int (*init)(struct subprocess_info *info),
+		    void (*cleanup)(struct subprocess_info *info),
+		    void *data)
 {
 	info->cleanup = cleanup;
+	info->init = init;
+	info->data = data;
 }
-EXPORT_SYMBOL(call_usermodehelper_setcleanup);
+EXPORT_SYMBOL(call_usermodehelper_setfns);
 
 /**
  * call_usermodehelper_stdinpipe - set up a pipe to be used for stdin
@@ -515,18 +554,21 @@ int call_usermodehelper_pipe(char *path, char **argv, char **envp,
 	struct subprocess_info *sub_info;
 	int ret;
 
-	sub_info = call_usermodehelper_setup(path, argv, envp, GFP_KERNEL);
+	sub_info = call_usermodehelper_setup(path, argv, envp,
+					     GFP_KERNEL);
 	if (sub_info == NULL)
 		return -ENOMEM;
 
 	ret = call_usermodehelper_stdinpipe(sub_info, filp);
-	if (ret < 0)
-		goto out;
+	if (ret < 0) {
+		call_usermodehelper_freeinfo(sub_info);
+		return ret;
+	}
 
-	return call_usermodehelper_exec(sub_info, UMH_WAIT_EXEC);
+	ret = call_usermodehelper_exec(sub_info, UMH_WAIT_EXEC);
+	if (ret < 0)	/* Failed to execute helper, close pipe */
+		filp_close(*filp, NULL);
 
-  out:
-	call_usermodehelper_freeinfo(sub_info);
 	return ret;
 }
 EXPORT_SYMBOL(call_usermodehelper_pipe);

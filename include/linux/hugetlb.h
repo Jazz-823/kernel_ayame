@@ -12,6 +12,15 @@ struct user_struct;
 #include <linux/shm.h>
 #include <asm/tlbflush.h>
 
+struct hugepage_subpool {
+	spinlock_t lock;
+	long count;
+	long max_hpages, used_hpages;
+};
+
+struct hugepage_subpool *hugepage_new_subpool(long nr_blocks);
+void hugepage_put_subpool(struct hugepage_subpool *spool);
+
 int PageHuge(struct page *page);
 
 static inline int is_vm_hugetlb_page(struct vm_area_struct *vma)
@@ -85,10 +94,10 @@ static inline unsigned long hugetlb_total_pages(void)
 	return 0;
 }
 
-#define follow_hugetlb_page(m,v,p,vs,a,b,i,w)	({ BUG(); 0; })
+#define follow_hugetlb_page(m,v,p,vs,a,b,i,w)	({ BUILD_BUG(); 0; })
 #define follow_huge_addr(mm, addr, write)	ERR_PTR(-EINVAL)
-#define copy_hugetlb_page_range(src, dst, vma)	({ BUG(); 0; })
-#define hugetlb_prefault(mapping, vma)		({ BUG(); 0; })
+#define copy_hugetlb_page_range(src, dst, vma)	({ BUILD_BUG(); 0; })
+#define hugetlb_prefault(mapping, vma)		({ BUILD_BUG(); 0; })
 #define unmap_hugepage_range(vma, start, end, page)	BUG()
 static inline void hugetlb_report_meminfo(struct seq_file *m)
 {
@@ -101,7 +110,7 @@ static inline void hugetlb_report_meminfo(struct seq_file *m)
 #define pud_huge(x)	0
 #define is_hugepage_only_range(mm, addr, len)	0
 #define hugetlb_free_pgd_range(tlb, addr, end, floor, ceiling) ({BUG(); 0; })
-#define hugetlb_fault(mm, vma, addr, flags)	({ BUG(); 0; })
+#define hugetlb_fault(mm, vma, addr, flags)	({ BUILD_BUG(); 0; })
 
 #define hugetlb_change_protection(vma, address, end, newprot)
 
@@ -138,12 +147,11 @@ struct hugetlbfs_config {
 };
 
 struct hugetlbfs_sb_info {
-	long	max_blocks;   /* blocks allowed */
-	long	free_blocks;  /* blocks free */
 	long	max_inodes;   /* inodes allowed */
 	long	free_inodes;  /* inodes free */
 	spinlock_t	stat_lock;
 	struct hstate *hstate;
+	struct hugepage_subpool *spool;
 };
 
 
@@ -166,8 +174,6 @@ extern const struct file_operations hugetlbfs_file_operations;
 extern const struct vm_operations_struct hugetlb_vm_ops;
 struct file *hugetlb_file_setup(const char *name, size_t size, int acct,
 				struct user_struct **user, int creat_flags);
-int hugetlb_get_quota(struct address_space *mapping, long delta);
-void hugetlb_put_quota(struct address_space *mapping, long delta);
 
 static inline int is_file_hugepages(struct file *file)
 {
